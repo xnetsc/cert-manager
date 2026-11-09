@@ -75,6 +75,10 @@ _ali_rest() {
   # same way dns_ali pre-encodes its Timestamp.
   query=$query'&SecurityToken='$(printf "%s" "$Ali_Token" | _url_encode)
 
+  # The string to sign must carry the parameters in sorted order
+  # (the token joined last, so re-sort the assembled pairs).
+  query=$(printf "%s" "$query" | tr '&' '\n' | LC_ALL=C sort | paste -sd'&' -)
+
   signature=$(printf "%s" "$mtd&%2F&$(printf "%s" "$query" | _url_encode upper-hex)" | _hmac "sha1" "$(printf "%s" "$Ali_Secret&" | _hex_dump | tr -d " ")" | _base64)
   signature=$(printf "%s" "$signature" | _url_encode upper-hex)
   url="$endpoint?Signature=$signature"

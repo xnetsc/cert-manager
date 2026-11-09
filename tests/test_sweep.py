@@ -112,7 +112,8 @@ def main():
             b"# certs\nexample.com\n*.example.org\nbad.example.net\n")
     logs = []
     failures = S.sweep(oss, runner=fake_runner_factory(
-        fail_domains=("bad.example.net",)), log=logs.append)
+        fail_domains=("bad.example.net",)), log=logs.append,
+        zone_checker=lambda d: "zone")
     check("sweep: one failure isolated", failures == 1)
     check("sweep: cert uploaded",
           "example.com/fullchain.pem" in oss.store and
@@ -136,7 +137,8 @@ def main():
     oss2 = CountingOss(oss)
     logs2 = []
     S.sweep(oss2, runner=fake_runner_factory(
-        fail_domains=("bad.example.net",)), log=logs2.append)
+        fail_domains=("bad.example.net",)), log=logs2.append,
+        zone_checker=lambda d: "zone")
     cert_puts = [k for k in oss2.puts if not k.startswith("state/")]
     check("sweep: fresh cert not re-uploaded", cert_puts == [])
     check("sweep: status says unchanged",
@@ -145,6 +147,52 @@ def main():
     # Missing registry: quiet no-op
     oss3 = FakeOss()
     check("sweep: missing registry is a no-op", S.sweep(oss3) == 0)
+
+    # DNS hosting pre-check: a zone not on Aliyun is skipped with a
+    # reason, acme.sh is never invoked for it, and it is not a failure.
+    called = []
+    base_runner = fake_runner_factory()
+
+    def tracking_runner(cmd, capture_output, text, env):
+        called.append(cmd[cmd.index("-d") + 1])
+        return base_runner(cmd, capture_output, text, env)
+
+    oss4 = FakeOss()
+    oss4.put(S.REGISTRY_KEY, b"example.com\nforeign.example.org\n")
+    logs4 = []
+    failures4 = S.sweep(
+        oss4, runner=tracking_runner, log=logs4.append,
+        zone_checker=lambda d: None if "foreign" in d else "zone")
+    check("precheck: foreign zone not a failure", failures4 == 0)
+    check("precheck: acme not invoked for foreign zone",
+          called == ["example.com"])
+    check("precheck: SKIP line names the reason",
+          any(line.startswith("SKIP foreign.example.org")
+              and "not hosted on Aliyun" in line for line in logs4))
+    check("precheck: hosted domain still issued",
+          "example.com/fullchain.pem" in oss4.store)
+
+    # Zone walking: subdomain resolves to its parent zone; a missing
+    # zone walks up and gives up cleanly.
+    answers = {
+        "sub.example.com": {"Code": "InvalidDomainName.NoExist"},
+        "example.com": {"DomainRecords": {"Record": []}},
+        "nowhere.zz": {"Code": "InvalidDomainName.NoExist"},
+    }
+    orig = S._alidns_describe
+    S._alidns_describe = lambda zone, creds: answers.get(
+        zone, {"Code": "InvalidDomainName.NoExist"})
+    try:
+        check("zone: walks up to the hosted parent",
+              S.find_aliyun_zone("sub.example.com", ("k", "s", "")) ==
+              "example.com")
+        check("zone: wildcard checks its base zone",
+              S.find_aliyun_zone("*.example.com", ("k", "s", "")) ==
+              "example.com")
+        check("zone: foreign zone returns None",
+              S.find_aliyun_zone("nowhere.zz", ("k", "s", "")) is None)
+    finally:
+        S._alidns_describe = orig
 
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

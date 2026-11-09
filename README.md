@@ -25,8 +25,11 @@ The function runs the same sweep on every invocation:
 
 1. Read `domains.txt`.
 2. Restore the acme.sh home from `state/`.
-3. For each domain: issue or renew via acme.sh (DNS-01 through the
-   Aliyun DNS API); upload cert files whose content changed.
+3. For each domain: first check that its DNS zone is hosted on
+   Aliyun DNS in this account (the DNS-01 hook can only write TXT
+   records there). A domain whose DNS lives elsewhere is **skipped
+   with the reason logged**, not failed inside acme.sh. Then issue
+   or renew via acme.sh; upload cert files whose content changed.
 4. Save the acme.sh home back to `state/`.
 
 Two triggers invoke it:

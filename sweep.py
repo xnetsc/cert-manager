@@ -22,6 +22,7 @@ import tarfile
 import tempfile
 import urllib.request
 import urllib.error
+import urllib.parse
 import base64
 import hmac
 import datetime
@@ -96,18 +97,99 @@ def metadata_credentials(role):
     return d["AccessKeyId"], d["AccessKeySecret"], d["SecurityToken"]
 
 
-def build_oss():
+def get_credentials():
+    """(key_id, key_secret, token) for this run: STS credentials of
+    the function's RAM role when CERTS_RAM_ROLE is set, else the
+    static env keys (local development)."""
     role = os.environ.get("CERTS_RAM_ROLE", "")
-    token = ""
     if role:
-        kid, ksec, token = metadata_credentials(role)
-    else:
-        kid = os.environ["OSS_ACCESS_KEY_ID"]
-        ksec = os.environ["OSS_ACCESS_KEY_SECRET"]
-        token = os.environ.get("OSS_TOKEN", "")
+        return metadata_credentials(role)
+    return (os.environ["OSS_ACCESS_KEY_ID"],
+            os.environ["OSS_ACCESS_KEY_SECRET"],
+            os.environ.get("OSS_TOKEN", ""))
+
+
+def build_oss():
+    kid, ksec, token = get_credentials()
     bucket = os.environ["CERTS_BUCKET"]
     endpoint = os.environ["CERTS_OSS_ENDPOINT"]
     return Oss(bucket, endpoint, kid, ksec, token)
+
+
+# ------------------------------------------------- DNS hosting check
+class ZoneCheckUnavailable(Exception):
+    pass
+
+
+def _ali_percent(s):
+    out = urllib.parse.quote(str(s), safe="")
+    return out.replace("+", "%20").replace("*", "%2A").replace("%7E", "~")
+
+
+def _alidns_describe(zone, creds):
+    """One DescribeDomainRecords call. Returns the parsed JSON on an
+    API-level answer; raises ZoneCheckUnavailable on transport or
+    auth-level failures (where 'not hosted' cannot be concluded)."""
+    import json
+    import uuid
+    kid, ksec, token = creds
+    params = {
+        "AccessKeyId": kid, "Action": "DescribeDomainRecords",
+        "DomainName": zone, "Format": "json", "PageSize": "1",
+        "SignatureMethod": "HMAC-SHA1",
+        "SignatureNonce": uuid.uuid4().hex,
+        "SignatureVersion": "1.0",
+        "Timestamp": datetime.datetime.now(datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "Version": "2015-01-09",
+    }
+    if token:
+        params["SecurityToken"] = token
+    canonical = "&".join(
+        f"{_ali_percent(k)}={_ali_percent(params[k])}"
+        for k in sorted(params))
+    sts = "GET&%2F&" + _ali_percent(canonical)
+    sig = base64.b64encode(hmac.new(
+        (ksec + "&").encode(), sts.encode(), hashlib.sha1).digest()
+    ).decode()
+    url = ("https://alidns.aliyuncs.com/?" + canonical +
+           "&Signature=" + _ali_percent(sig))
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read())
+        except Exception:
+            raise ZoneCheckUnavailable(f"HTTP {e.code}")
+    except Exception as e:
+        raise ZoneCheckUnavailable(str(e))
+
+
+def find_aliyun_zone(domain, creds):
+    """The Aliyun-DNS zone that would serve this domain, or None when
+    the zone is not hosted in this account. Walks up from the full
+    name (sans '*.'), asking the DNS API about each candidate."""
+    name = domain[2:] if domain.startswith("*.") else domain
+    labels = name.split(".")
+    for i in range(len(labels) - 1):
+        cand = ".".join(labels[i:])
+        if cand.count(".") < 1:
+            break
+        d = _alidns_describe(cand, creds)
+        if "DomainRecords" in d:
+            return cand
+        code = d.get("Code", "")
+        if "Forbidden" in code or "InvalidAccessKeyId" in code \
+                or "Signature" in code:
+            raise ZoneCheckUnavailable(f"DNS API auth error: {code}")
+        # Any other API answer means: not this zone; walk up.
+    return None
+
+
+def default_zone_checker():
+    creds = get_credentials()
+    return lambda domain: find_aliyun_zone(domain, creds)
 
 
 # ------------------------------------------------------------ registry
@@ -248,17 +330,33 @@ def manage_domain(oss, home, domain, runner=subprocess.run):
     return f"OK {domain}: {state} (expires in {days}d)"
 
 
-def sweep(oss, runner=subprocess.run, log=print):
+def sweep(oss, runner=subprocess.run, log=print, zone_checker=None):
     raw = oss.get(REGISTRY_KEY)
     if raw is None:
         log(f"registry {REGISTRY_KEY} not found; nothing to do")
         return 0
     domains = parse_registry(raw.decode("utf-8"))
     log(f"registry: {len(domains)} domain(s)")
+    if zone_checker is None:
+        zone_checker = default_zone_checker()
     failures = 0
     with tempfile.TemporaryDirectory() as workdir:
         home = acme_home_state(oss, workdir)
         for domain in domains:
+            # Special handling (user, 2026-11-09): the DNS-01 hook can
+            # only serve zones hosted on Aliyun DNS in this account.
+            # Check first; a foreign zone is skipped with the reason,
+            # not failed opaquely inside acme.sh.
+            try:
+                zone = zone_checker(domain)
+            except ZoneCheckUnavailable as e:
+                log(f"WARN {domain}: DNS hosting check unavailable "
+                    f"({e}); proceeding")
+                zone = "?"
+            if zone is None:
+                log(f"SKIP {domain}: DNS is not hosted on Aliyun; "
+                    f"the DNS-01 hook cannot set TXT records for it")
+                continue
             try:
                 line = manage_domain(oss, home, domain, runner=runner)
                 log(line)
