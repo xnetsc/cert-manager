@@ -339,6 +339,18 @@ def upload_cert_files(oss, domain, cert_dir):
     return f"OK {domain}: {state} (expires in {days}d)"
 
 
+def _fail_with_output(domain, what, r):
+    """Build a FAIL line from an acme.sh run and print the captured
+    output to stdout, so the platform log service keeps the API's
+    own error message for diagnosis."""
+    out = (r.stdout + r.stderr).strip()
+    if out:
+        print(f"--- acme.sh output for {domain} ---\n{out[-8000:]}\n"
+              f"--- end ---", flush=True)
+    tail = out.splitlines()[-4:] if out else []
+    return f"FAIL {domain}: {what}: {' | '.join(tail)}"
+
+
 def manage_domain(oss, home, domain, runner=subprocess.run):
     """Issue/renew one Aliyun-hosted domain; upload when changed.
     Returns a one-line status string."""
@@ -355,8 +367,7 @@ def manage_domain(oss, home, domain, runner=subprocess.run):
     cert_dir = find_cert_dir(home, domain)
     full = os.path.join(cert_dir, "fullchain.cer") if cert_dir else ""
     if not cert_dir or not os.path.exists(full):
-        tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
-        return f"FAIL {domain}: no cert produced: {' | '.join(tail)}"
+        return _fail_with_output(domain, "no cert produced", r)
     return upload_cert_files(oss, domain, cert_dir)
 
 
@@ -446,6 +457,7 @@ def manage_manual_domain(oss, home, domain, runner=subprocess.run):
             del state[domain]
             _save_manual_state(home, state)
             return upload_cert_files(oss, domain, cert_dir)
+        _fail_with_output(domain, "manual resume failed", r)
         # TXT missing/wrong or order expired: fall through to a
         # fresh phase 1 (new order, new TXT, new instruction file).
 
@@ -473,8 +485,7 @@ def manage_manual_domain(oss, home, domain, runner=subprocess.run):
             state.pop(domain, None)
             _save_manual_state(home, state)
             return upload_cert_files(oss, domain, cert_dir)
-    tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
-    return f"FAIL {domain}: manual issue failed: {' | '.join(tail)}"
+    return _fail_with_output(domain, "manual issue failed", r)
 
 
 def sweep(oss, runner=subprocess.run, log=print, zone_checker=None):
