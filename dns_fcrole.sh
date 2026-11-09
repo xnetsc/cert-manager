@@ -44,6 +44,14 @@ dns_fcrole_rm() {
 ####################  credentials  ####################
 
 _fcrole_credentials() {
+  # Function Compute injects the role's STS credentials into the
+  # environment; that is the primary source.
+  if [ -n "$ALIBABA_CLOUD_ACCESS_KEY_ID" ] && [ -n "$ALIBABA_CLOUD_ACCESS_KEY_SECRET" ]; then
+    Ali_Key="$ALIBABA_CLOUD_ACCESS_KEY_ID"
+    Ali_Secret="$ALIBABA_CLOUD_ACCESS_KEY_SECRET"
+    Ali_Token="$ALIBABA_CLOUD_SECURITY_TOKEN"
+    return 0
+  fi
   role="${CERTS_RAM_ROLE:-}"
   if [ -z "$role" ]; then
     _err "CERTS_RAM_ROLE is not set."

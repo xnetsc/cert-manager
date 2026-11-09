@@ -220,6 +220,16 @@ def main():
           any(line.startswith("OK foreign.example.org")
               for line in logs6))
 
+    # Credentials: FC-injected env vars win over every other source.
+    os.environ["ALIBABA_CLOUD_ACCESS_KEY_ID"] = "env-kid"
+    os.environ["ALIBABA_CLOUD_ACCESS_KEY_SECRET"] = "env-secret"
+    os.environ["ALIBABA_CLOUD_SECURITY_TOKEN"] = "env-token"
+    check("creds: FC env injection is used",
+          S.get_credentials() == ("env-kid", "env-secret", "env-token"))
+    del os.environ["ALIBABA_CLOUD_ACCESS_KEY_ID"]
+    del os.environ["ALIBABA_CLOUD_ACCESS_KEY_SECRET"]
+    del os.environ["ALIBABA_CLOUD_SECURITY_TOKEN"]
+
     # Zone walking: subdomain resolves to its parent zone; a missing
     # zone walks up and gives up cleanly.
     answers = {

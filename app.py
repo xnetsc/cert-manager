@@ -17,9 +17,16 @@ def run_once():
     if not _lock.acquire(blocking=False):
         return {"status": "already running"}
     lines = []
+
+    def _log(line):
+        # Both: into the invoke response and onto stdout, where the
+        # platform log service can see it.
+        lines.append(line)
+        print(line, flush=True)
+
     try:
         oss = sweep_mod.build_oss()
-        failures = sweep_mod.sweep(oss, log=lines.append)
+        failures = sweep_mod.sweep(oss, log=_log)
         _last["status"] = "\n".join(lines)
         return {"status": "done", "failures": failures, "log": lines}
     except Exception as e:

@@ -98,9 +98,17 @@ def metadata_credentials(role):
 
 
 def get_credentials():
-    """(key_id, key_secret, token) for this run: STS credentials of
-    the function's RAM role when CERTS_RAM_ROLE is set, else the
-    static env keys (local development)."""
+    """(key_id, key_secret, token) for this run. Function Compute
+    injects the function's role credentials into the environment
+    (ALIBABA_CLOUD_ACCESS_KEY_ID / _SECRET / _SECURITY_TOKEN) -
+    that is the primary source. Fallbacks: the ECS-style metadata
+    endpoint when CERTS_RAM_ROLE is set, then static env keys for
+    local development."""
+    kid = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID", "")
+    ksec = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "")
+    if kid and ksec:
+        return kid, ksec, os.environ.get(
+            "ALIBABA_CLOUD_SECURITY_TOKEN", "")
     role = os.environ.get("CERTS_RAM_ROLE", "")
     if role:
         return metadata_credentials(role)
