@@ -251,64 +251,65 @@ def sha256(b):
 
 
 # ------------------------------------------------------------ triggers
-def oss_event_keys(payload):
-    """Object keys from an FC OSS-trigger event (parsed JSON), or
-    None when the payload is not an OSS event."""
+def oss_events(payload):
+    """(key, eventName) pairs from an FC OSS-trigger event (parsed
+    JSON), or None when the payload is not an OSS event."""
     try:
         events = payload["events"]
-        keys = []
+        out = []
         for e in events:
             key = e["oss"]["object"]["key"]
             from urllib.parse import unquote_plus
-            keys.append(unquote_plus(key))
-        return keys
+            out.append((unquote_plus(key), e.get("eventName", "")))
+        return out
     except (TypeError, KeyError, AttributeError):
         return None
 
 
+def oss_event_keys(payload):
+    ev = oss_events(payload)
+    return None if ev is None else [k for k, _ in ev]
+
+
 def should_run(payload):
     """Decide whether an invocation runs the sweep. Timer triggers
-    and manual invokes always run. OSS events run ONLY when the
-    registry file itself changed - the sweep's own writes to the
-    bucket (certs, state) must never retrigger it."""
+    and manual invokes always run. OSS events run when the registry
+    file changed, or when a pending-manual instruction file was
+    DELETED (the user's 'TXT is set' signal). The sweep's own writes
+    to the bucket (certs, state, instruction files) never retrigger
+    it."""
     if not payload:
         return True
-    keys = oss_event_keys(payload)
-    if keys is None:
+    ev = oss_events(payload)
+    if ev is None:
         return True
-    return REGISTRY_KEY in keys
+    for key, name in ev:
+        if key == REGISTRY_KEY:
+            return True
+        if key.startswith("pending/") and "Delete" in name:
+            return True
+    return False
 
 
-def manage_domain(oss, home, domain, runner=subprocess.run):
-    """Issue/renew one domain; upload to its folder when changed.
-    Returns a one-line status string."""
-    folder = folder_for(domain)
-    acme = os.path.join(home, "acme.sh")
-    env = dict(os.environ)
-    env["HOME"] = home
-    hook = os.environ.get("CERTS_DNS_HOOK", "dns_fcrole")
-    cmd = [acme, "--home", home, "--issue", "--dns", hook,
-           "-d", domain, "--server", DEFAULT_SERVER,
-           "--dnssleep", str(DNS_SLEEP), "--keylength", "ec-256"]
-    r = runner(cmd, capture_output=True, text=True, env=env)
-    # acme.sh exits 0 on issue/renew, 2 when not due yet (with the
-    # default config a fresh --issue on an existing fresh cert is a
-    # no-op success); either way, judge by the cert on disk.
+def find_cert_dir(home, domain):
     # acme.sh keeps certs in <home>/<domain>[_ecc]/ with the domain
     # spelled as given ('*' included for wildcards).
-    import glob
-    cert_dir = None
+    folder = folder_for(domain)
     for cand in (os.path.join(home, domain),
                  os.path.join(home, domain + "_ecc"),
                  os.path.join(home, folder),
                  os.path.join(home, folder + "_ecc")):
         if os.path.isdir(cand):
-            cert_dir = cand
-            break
-    full = os.path.join(cert_dir, "fullchain.cer") if cert_dir else ""
-    if not cert_dir or not os.path.exists(full):
-        tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
-        return f"FAIL {domain}: no cert produced: {' | '.join(tail)}"
+            return cand
+    return None
+
+
+def upload_cert_files(oss, domain, cert_dir):
+    """Upload the cert files of one domain whose content changed.
+    Returns the OK status line."""
+    import glob
+    folder = folder_for(domain)
+    full = os.path.join(cert_dir, "fullchain.cer")
     days = cert_days_left(full)
     keys = glob.glob(os.path.join(cert_dir, "*.key"))
     leaf = [p for p in glob.glob(os.path.join(cert_dir, "*.cer"))
@@ -319,7 +320,7 @@ def manage_domain(oss, home, domain, runner=subprocess.run):
              "chain.pem": os.path.join(cert_dir, "ca.cer")}
     changed = []
     for name, path in files.items():
-        if not os.path.exists(path):
+        if not path or not os.path.exists(path):
             continue
         data = open(path, "rb").read()
         remote = oss.get(f"{folder}/{name}")
@@ -328,6 +329,144 @@ def manage_domain(oss, home, domain, runner=subprocess.run):
             changed.append(name)
     state = "updated " + ",".join(changed) if changed else "unchanged"
     return f"OK {domain}: {state} (expires in {days}d)"
+
+
+def manage_domain(oss, home, domain, runner=subprocess.run):
+    """Issue/renew one Aliyun-hosted domain; upload when changed.
+    Returns a one-line status string."""
+    acme = os.path.join(home, "acme.sh")
+    env = dict(os.environ)
+    env["HOME"] = home
+    hook = os.environ.get("CERTS_DNS_HOOK", "dns_fcrole")
+    cmd = [acme, "--home", home, "--issue", "--dns", hook,
+           "-d", domain, "--server", DEFAULT_SERVER,
+           "--dnssleep", str(DNS_SLEEP), "--keylength", "ec-256"]
+    r = runner(cmd, capture_output=True, text=True, env=env)
+    # acme.sh exits 0 on issue/renew; either way, judge by the cert
+    # on disk.
+    cert_dir = find_cert_dir(home, domain)
+    full = os.path.join(cert_dir, "fullchain.cer") if cert_dir else ""
+    if not cert_dir or not os.path.exists(full):
+        tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
+        return f"FAIL {domain}: no cert produced: {' | '.join(tail)}"
+    return upload_cert_files(oss, domain, cert_dir)
+
+
+# ------------------------------------------- manual DNS (foreign zone)
+MANUAL_FLAG = "--yes-I-know-dns-manual-mode-enough-go-ahead-please"
+CODE_DNS_MANUAL = 3  # acme.sh's distinct manual-mode exit code
+
+
+def _manual_state_path(home):
+    return os.path.join(home, ".certmgr.json")
+
+
+def _load_manual_state(home):
+    import json
+    try:
+        with open(_manual_state_path(home)) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_manual_state(home, state):
+    import json
+    with open(_manual_state_path(home), "w") as f:
+        json.dump(state, f)
+
+
+def _parse_manual_txt(output):
+    rec = re.search(r"Domain: '([^']+)'", output)
+    val = re.search(r"TXT value: '([^']+)'", output)
+    if rec and val:
+        return rec.group(1), val.group(1)
+    return None
+
+
+def _instruction_text(domain, record, value):
+    return (
+        "这个域名的 DNS 不在阿里云，需要手动设置一条 TXT 记录。\n"
+        f"域名: {domain}\n"
+        "请在该域名的 DNS 服务商处添加:\n"
+        f"  记录名: {record}\n"
+        "  类型: TXT\n"
+        f"  值: {value}\n"
+        "设置完成后，删除本文件。删除动作会触发函数检查记录是否"
+        "已生效，生效则完成签发，证书会出现在以域名命名的文件夹里。\n")
+
+
+def manage_manual_domain(oss, home, domain, runner=subprocess.run):
+    """Two-phase issuance for a domain whose DNS is NOT on Aliyun
+    (user spec, 2026-11-09). Phase 1 runs acme.sh in manual DNS
+    mode, which stops with a TXT to publish; the TXT goes into an
+    instruction file at pending/<domain>.txt for the user. The
+    user sets the TXT, then DELETES the instruction file; the next
+    sweep sees the deletion (via persisted state) and resumes with
+    --renew, which verifies the TXT and completes issuance. If the
+    TXT is not (yet) correct, phase 1 runs again with a fresh TXT.
+    """
+    acme = os.path.join(home, "acme.sh")
+    env = dict(os.environ)
+    env["HOME"] = home
+    folder = folder_for(domain)
+    instr_key = f"pending/{folder}.txt"
+    state = _load_manual_state(home)
+
+    # A fresh-enough cert needs no dance at all.
+    cert_dir = find_cert_dir(home, domain)
+    if cert_dir:
+        full = os.path.join(cert_dir, "fullchain.cer")
+        if os.path.exists(full):
+            days = cert_days_left(full)
+            if days is not None and days > RENEW_BEFORE_DAYS \
+                    and domain not in state:
+                return upload_cert_files(oss, domain, cert_dir)
+
+    if domain in state:
+        if oss.get(instr_key) is not None:
+            return (f"WAIT {domain}: manual TXT pending; set it and "
+                    f"delete {instr_key}")
+        # Instruction deleted: the user signals the TXT is set.
+        cmd = [acme, "--home", home, "--renew", "-d", domain,
+               "--dnssleep", "5", MANUAL_FLAG]
+        r = runner(cmd, capture_output=True, text=True, env=env)
+        cert_dir = find_cert_dir(home, domain)
+        full = os.path.join(cert_dir, "fullchain.cer") \
+            if cert_dir else ""
+        if r.returncode == 0 and cert_dir and os.path.exists(full):
+            del state[domain]
+            _save_manual_state(home, state)
+            return upload_cert_files(oss, domain, cert_dir)
+        # TXT missing/wrong or order expired: fall through to a
+        # fresh phase 1 (new order, new TXT, new instruction file).
+
+    cmd = [acme, "--home", home, "--issue", "--dns",
+           "-d", domain, "--server", DEFAULT_SERVER,
+           "--keylength", "ec-256", MANUAL_FLAG]
+    r = runner(cmd, capture_output=True, text=True, env=env)
+    if r.returncode == CODE_DNS_MANUAL:
+        parsed = _parse_manual_txt(r.stdout + r.stderr)
+        if not parsed:
+            return f"FAIL {domain}: manual mode stopped but no TXT found in output"
+        record, value = parsed
+        oss.put(instr_key,
+                _instruction_text(domain, record, value).encode())
+        state[domain] = {"record": record, "value": value}
+        _save_manual_state(home, state)
+        return (f"MANUAL {domain}: TXT instruction written to "
+                f"{instr_key}")
+    if r.returncode == 0:
+        # Validations were still cached at the CA: issued outright.
+        cert_dir = find_cert_dir(home, domain)
+        full = os.path.join(cert_dir, "fullchain.cer") \
+            if cert_dir else ""
+        if cert_dir and os.path.exists(full):
+            state.pop(domain, None)
+            _save_manual_state(home, state)
+            return upload_cert_files(oss, domain, cert_dir)
+    tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
+    return f"FAIL {domain}: manual issue failed: {' | '.join(tail)}"
 
 
 def sweep(oss, runner=subprocess.run, log=print, zone_checker=None):
@@ -343,22 +482,23 @@ def sweep(oss, runner=subprocess.run, log=print, zone_checker=None):
     with tempfile.TemporaryDirectory() as workdir:
         home = acme_home_state(oss, workdir)
         for domain in domains:
-            # Special handling (user, 2026-11-09): the DNS-01 hook can
-            # only serve zones hosted on Aliyun DNS in this account.
-            # Check first; a foreign zone is skipped with the reason,
-            # not failed opaquely inside acme.sh.
+            # Special handling (user, 2026-11-09): check first whether
+            # the zone is hosted on Aliyun DNS in this account. Hosted
+            # zones are fully automatic via the role hook; foreign
+            # zones go through the two-phase manual-TXT flow.
             try:
                 zone = zone_checker(domain)
             except ZoneCheckUnavailable as e:
                 log(f"WARN {domain}: DNS hosting check unavailable "
                     f"({e}); proceeding")
                 zone = "?"
-            if zone is None:
-                log(f"SKIP {domain}: DNS is not hosted on Aliyun; "
-                    f"the DNS-01 hook cannot set TXT records for it")
-                continue
             try:
-                line = manage_domain(oss, home, domain, runner=runner)
+                if zone is None:
+                    line = manage_manual_domain(
+                        oss, home, domain, runner=runner)
+                else:
+                    line = manage_domain(
+                        oss, home, domain, runner=runner)
                 log(line)
                 if line.startswith("FAIL"):
                     failures += 1

@@ -105,6 +105,16 @@ def main():
     oss_ev3 = {"events": [{"oss": {"object": {
         "key": "state/acme-home.tar.gz"}}}]}
     check("trigger: state write ignored", not S.should_run(oss_ev3))
+    pend_del = {"events": [{"eventName": "ObjectRemoved:DeleteObject",
+                            "oss": {"object": {
+                                "key": "pending/foreign.example.org.txt"}}}]}
+    check("trigger: pending instruction deletion runs",
+          S.should_run(pend_del))
+    pend_put = {"events": [{"eventName": "ObjectCreated:PutObject",
+                            "oss": {"object": {
+                                "key": "pending/foreign.example.org.txt"}}}]}
+    check("trigger: pending instruction creation ignored",
+          not S.should_run(pend_put))
 
     # Full sweep: two domains, one failing
     oss = FakeOss()
@@ -148,29 +158,67 @@ def main():
     oss3 = FakeOss()
     check("sweep: missing registry is a no-op", S.sweep(oss3) == 0)
 
-    # DNS hosting pre-check: a zone not on Aliyun is skipped with a
-    # reason, acme.sh is never invoked for it, and it is not a failure.
-    called = []
-    base_runner = fake_runner_factory()
+    # DNS hosting pre-check + manual flow for foreign zones, over
+    # three sweeps sharing one bucket (state must carry the phase):
+    # 1) foreign zone -> instruction file with the TXT, no cert yet
+    # 2) file still there -> WAIT, no completion attempt
+    # 3) file deleted + TXT set -> resume completes, cert uploaded
+    manual_ready = set()
 
-    def tracking_runner(cmd, capture_output, text, env):
-        called.append(cmd[cmd.index("-d") + 1])
-        return base_runner(cmd, capture_output, text, env)
+    def manual_runner(cmd, capture_output, text, env):
+        home = cmd[2]
+        domain = cmd[cmd.index("-d") + 1]
+        if "--renew" in cmd:
+            if domain in manual_ready:
+                cer, key = make_cert(domain)
+                cdir = os.path.join(home, domain + "_ecc")
+                os.makedirs(cdir, exist_ok=True)
+                for name, data in (("fullchain.cer", cer),
+                                   (domain + ".cer", cer),
+                                   ("ca.cer", cer),
+                                   (domain + ".key", key)):
+                    with open(os.path.join(cdir, name), "wb") as fh:
+                        fh.write(data)
+                return subprocess.CompletedProcess(cmd, 0, "renewed", "")
+            return subprocess.CompletedProcess(cmd, 1, "", "txt not found")
+        # --issue in manual mode (bare --dns): stop with the TXT.
+        out = (f"Domain: '_acme-challenge.{domain}'\n"
+               f"TXT value: 'txt-{domain}'\n")
+        return subprocess.CompletedProcess(cmd, 3, out, "")
 
     oss4 = FakeOss()
-    oss4.put(S.REGISTRY_KEY, b"example.com\nforeign.example.org\n")
+    oss4.put(S.REGISTRY_KEY, b"foreign.example.org\n")
     logs4 = []
-    failures4 = S.sweep(
-        oss4, runner=tracking_runner, log=logs4.append,
-        zone_checker=lambda d: None if "foreign" in d else "zone")
-    check("precheck: foreign zone not a failure", failures4 == 0)
-    check("precheck: acme not invoked for foreign zone",
-          called == ["example.com"])
-    check("precheck: SKIP line names the reason",
-          any(line.startswith("SKIP foreign.example.org")
-              and "not hosted on Aliyun" in line for line in logs4))
-    check("precheck: hosted domain still issued",
-          "example.com/fullchain.pem" in oss4.store)
+    failures4 = S.sweep(oss4, runner=manual_runner, log=logs4.append,
+                         zone_checker=lambda d: None)
+    instr_key = "pending/foreign.example.org.txt"
+    check("manual: phase 1 not a failure", failures4 == 0)
+    check("manual: instruction file written with the TXT",
+          instr_key in oss4.store and
+          b"txt-foreign.example.org" in oss4.store[instr_key])
+    check("manual: MANUAL line logged",
+          any(line.startswith("MANUAL foreign.example.org")
+              for line in logs4))
+    check("manual: no cert yet",
+          "foreign.example.org/fullchain.pem" not in oss4.store)
+
+    logs5 = []
+    S.sweep(oss4, runner=manual_runner, log=logs5.append,
+            zone_checker=lambda d: None)
+    check("manual: still waiting while instruction file exists",
+          any(line.startswith("WAIT foreign.example.org")
+              for line in logs5))
+
+    # The user sets the TXT and deletes the instruction file.
+    del oss4.store[instr_key]
+    manual_ready.add("foreign.example.org")
+    logs6 = []
+    S.sweep(oss4, runner=manual_runner, log=logs6.append,
+            zone_checker=lambda d: None)
+    check("manual: resume after deletion issues the cert",
+          "foreign.example.org/fullchain.pem" in oss4.store and
+          any(line.startswith("OK foreign.example.org")
+              for line in logs6))
 
     # Zone walking: subdomain resolves to its parent zone; a missing
     # zone walks up and gives up cleanly.
