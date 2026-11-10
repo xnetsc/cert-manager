@@ -33,6 +33,10 @@ STATE_KEY = "state/acme-home.tar.gz"
 RENEW_BEFORE_DAYS = 30
 DNS_SLEEP = int(os.environ.get("CERTS_DNS_SLEEP", "20"))
 DEFAULT_SERVER = os.environ.get("CERTS_CA", "letsencrypt")
+# RSA-2048 by default: some consumers of the issued certs (FC custom
+# domains, verified 2026-11-10) reject EC keys outright, while every
+# consumer accepts RSA. Override with CERTS_KEYLENGTH (e.g. ec-256).
+KEYLENGTH = os.environ.get("CERTS_KEYLENGTH", "2048")
 
 
 # ---------------------------------------------------------------- OSS
@@ -354,6 +358,17 @@ def _fail_with_output(domain, what, r):
     return f"FAIL {domain}: {what}: {' | '.join(tail)}"
 
 
+def _keylength_matches(home, domain):
+    """True when the stored cert's key already matches KEYLENGTH.
+    acme.sh keeps EC certs in a '<domain>_ecc' dir and RSA certs in
+    the plain dir, so the dir name is the discriminator."""
+    cert_dir = find_cert_dir(home, domain)
+    if not cert_dir:
+        return True  # nothing stored; a fresh issue uses KEYLENGTH
+    is_ecc_dir = cert_dir.endswith("_ecc")
+    return is_ecc_dir == KEYLENGTH.startswith("ec-")
+
+
 def manage_domain(oss, home, domain, runner=subprocess.run):
     """Issue/renew one Aliyun-hosted domain; upload when changed.
     Returns a one-line status string."""
@@ -363,7 +378,12 @@ def manage_domain(oss, home, domain, runner=subprocess.run):
     hook = os.environ.get("CERTS_DNS_HOOK", "dns_fcrole")
     cmd = [acme, "--home", home, "--issue", "--dns", hook,
            "-d", domain, "--server", DEFAULT_SERVER,
-           "--dnssleep", str(DNS_SLEEP), "--keylength", "ec-256"]
+           "--dnssleep", str(DNS_SLEEP), "--keylength", KEYLENGTH]
+    if not _keylength_matches(home, domain):
+        # Stored key is of the other family (e.g. an EC cert from
+        # before the RSA switch): acme.sh would keep renewing it as
+        # is, so force a re-issue under the configured key length.
+        cmd.append("--force")
     r = runner(cmd, capture_output=True, text=True, env=env)
     # acme.sh exits 0 on issue/renew; either way, judge by the cert
     # on disk.
@@ -466,7 +486,7 @@ def manage_manual_domain(oss, home, domain, runner=subprocess.run):
 
     cmd = [acme, "--home", home, "--issue", "--dns",
            "-d", domain, "--server", DEFAULT_SERVER,
-           "--keylength", "ec-256", MANUAL_FLAG]
+           "--keylength", KEYLENGTH, MANUAL_FLAG]
     r = runner(cmd, capture_output=True, text=True, env=env)
     if r.returncode == CODE_DNS_MANUAL:
         parsed = _parse_manual_txt(r.stdout + r.stderr)

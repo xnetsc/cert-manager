@@ -122,6 +122,41 @@ def main():
           os.path.exists(os.path.join(home2, "account.conf")))
     seed_home(None)  # restore the stub ACME_SRC for the later tests
 
+    # Key family: stored EC cert + RSA config must force a re-issue;
+    # matching families must not.
+    home3 = tempfile.mkdtemp()
+    check("keylength: nothing stored matches",
+          S._keylength_matches(home3, "x.com") is True)
+    os.makedirs(os.path.join(home3, "x.com_ecc"))
+    check("keylength: EC stored vs RSA config mismatches",
+          S._keylength_matches(home3, "x.com") is False)
+    os.makedirs(os.path.join(home3, "y.com"))
+    check("keylength: RSA stored matches RSA config",
+          S._keylength_matches(home3, "y.com") is True)
+    seen = {}
+
+    def capturing_runner(cmd, capture_output, text, env):
+        seen["cmd"] = cmd
+        cdir = os.path.join(cmd[2], "x.com")
+        os.makedirs(cdir, exist_ok=True)
+        cer, key = make_cert("x.com")
+        with open(os.path.join(cdir, "fullchain.cer"), "wb") as f:
+            f.write(cer)
+        with open(os.path.join(cdir, "x.com.cer"), "wb") as f:
+            f.write(cer)
+        with open(os.path.join(cdir, "ca.cer"), "wb") as f:
+            f.write(cer)
+        with open(os.path.join(cdir, "x.com.key"), "wb") as f:
+            f.write(key)
+        return subprocess.CompletedProcess(cmd, 0, "issued", "")
+
+    line = S.manage_domain(FakeOss(), home3, "x.com",
+                           runner=capturing_runner)
+    check("keylength: re-issue forced on family switch",
+          "--force" in seen["cmd"] and
+          seen["cmd"][seen["cmd"].index("--keylength") + 1] == "2048" and
+          line.startswith("OK"))
+
     # Trigger classification
     check("trigger: timer/manual runs", S.should_run(None) and
           S.should_run({}))
