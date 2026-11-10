@@ -94,6 +94,34 @@ def main():
     check("folder: wildcard sanitized",
           S.folder_for("*.example.com") == "_.example.com")
 
+    # Program tree always comes from the image (ACME_SRC), even when
+    # the saved state carries a stale copy; state-only files survive.
+    import io as _io, tarfile as _tf
+    src2 = tempfile.mkdtemp()
+    os.makedirs(os.path.join(src2, "dnsapi"))
+    with open(os.path.join(src2, "acme.sh"), "w") as f:
+        f.write("#!/bin/sh\n")
+    with open(os.path.join(src2, "dnsapi", "dns_fcrole.sh"), "w") as f:
+        f.write("FRESH\n")
+    stale = tempfile.mkdtemp()
+    os.makedirs(os.path.join(stale, "dnsapi"))
+    with open(os.path.join(stale, "dnsapi", "dns_fcrole.sh"), "w") as f:
+        f.write("STALE\n")
+    with open(os.path.join(stale, "account.conf"), "w") as f:
+        f.write("state\n")
+    buf = _io.BytesIO()
+    with _tf.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(stale, arcname=".")
+    oss2 = FakeOss()
+    oss2.put(S.STATE_KEY, buf.getvalue())
+    os.environ["ACME_SRC"] = src2
+    home2 = S.acme_home_state(oss2, tempfile.mkdtemp())
+    with open(os.path.join(home2, "dnsapi", "dns_fcrole.sh")) as f:
+        check("state: hook refreshed from image", f.read() == "FRESH\n")
+    check("state: account data survives overlay",
+          os.path.exists(os.path.join(home2, "account.conf")))
+    seed_home(None)  # restore the stub ACME_SRC for the later tests
+
     # Trigger classification
     check("trigger: timer/manual runs", S.should_run(None) and
           S.should_run({}))

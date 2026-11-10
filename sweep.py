@@ -224,12 +224,15 @@ def acme_home_state(oss, workdir):
     if blob:
         with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
             tar.extractall(home)
-    if not os.path.exists(os.path.join(home, "acme.sh")):
-        # First run (or a wiped state): seed the home from the tree
-        # baked into the image.
-        import shutil
-        src = os.environ.get("ACME_SRC", "/opt/acme.sh")
-        shutil.copytree(src, home, dirs_exist_ok=True)
+    # The program tree (acme.sh itself and the DNS hooks) ALWAYS
+    # comes from the image; the saved state contributes only account
+    # and certificate data, which the pristine image tree does not
+    # contain, so overlaying cannot clobber it. (Seeding the tree
+    # from state on the first run froze it there: later image
+    # updates never reached the hook that runs.)
+    import shutil
+    src = os.environ.get("ACME_SRC", "/opt/acme.sh")
+    shutil.copytree(src, home, dirs_exist_ok=True)
     return home
 
 
