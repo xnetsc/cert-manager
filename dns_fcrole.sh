@@ -79,9 +79,15 @@ _ali_rest() {
   ign="$2"
   mtd="${3:-GET}"
 
-  # The STS token is part of the signed parameter set, encoded the
-  # same way dns_ali pre-encodes its Timestamp.
-  query=$query'&SecurityToken='$(printf "%s" "$Ali_Token" | _url_encode)
+  # The STS token is part of the signed parameter set. It MUST be
+  # encoded with upper-case hex: the server rebuilds the canonical
+  # query with upper-case percent-encodings before verifying the
+  # signature, so a token encoded with _url_encode's default
+  # lower-case hex (%2f for '/') never matches its calculation.
+  # (dns_ali never hit this: none of its values contain characters
+  # whose encodings carry hex letters. The driver's Python signer
+  # uses upper-case hex throughout and verifies fine.)
+  query=$query'&SecurityToken='$(printf "%s" "$Ali_Token" | _url_encode upper-hex)
 
   # The string to sign must carry the parameters in sorted order
   # (the token joined last, so re-sort the assembled pairs).
