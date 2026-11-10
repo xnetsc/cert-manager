@@ -137,7 +137,7 @@ _get_root() {
   while true; do
     h=$(printf "%s" "$domain" | cut -d . -f "$i"-100)
     if [ -z "$h" ]; then
-      _err "root zone lookup failed (token length ${#Ali_Token}); last DNS API response: $(printf '%s' "$response" | head -c 6000)"
+      _err "root zone lookup failed (token length ${#Ali_Token}); last DNS API response: $(printf '%s' "$response" | head -c 400)"
       return 1
     fi
 
